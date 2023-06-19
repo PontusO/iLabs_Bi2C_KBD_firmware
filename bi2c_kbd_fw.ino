@@ -18,6 +18,7 @@
 
 #include <Wire.h>
 #include <CircularBuffer.h>
+#include <megaTinyCore.h>
 
 #if defined(ARDUINO_AVR_MEGA2560)
   #define BUILD_FOR_ATMEGA
@@ -30,14 +31,18 @@ CircularBuffer<uint8_t, 16> key_queue;
 
 #define NUM_ROWS  4
 #define NUM_COLS  4
+#define NUM_LEDS  5
+
 #if defined(BUILD_FOR_ATMEGA)
-static const uint8_t columns[NUM_COLS] = {22, 23, 24, 25 };
-static const uint8_t rows[NUM_ROWS] = {26, 27, 28, 29 };
+static const uint8_t columns[NUM_COLS] = {22, 23, 24, 25};
+static const uint8_t rows[NUM_ROWS] = {26, 27, 28, 29};
+static const uint8_t led_pins[NUM_LEDS] = {30, 31, 32, 33, 34};
 const uint8_t INT_PIN = 30;
 const uint8_t LED_CTRL_PIN = 31;
 #else
-static const uint8_t columns[NUM_COLS] = {PIN_PC1, PIN_PC2, PIN_PC3, PIN_PA1 };
-static const uint8_t rows[NUM_ROWS] = {PIN_PB2, PIN_PB3, PIN_PB4, PIN_PB5 };
+static const uint8_t columns[NUM_COLS] = {PIN_PC1, PIN_PC2, PIN_PC3, PIN_PA1};
+static const uint8_t rows[NUM_ROWS] = {PIN_PB2, PIN_PB3, PIN_PB4, PIN_PB5};
+static const uint8_t led_pins[NUM_LEDS] = {PIN_PA6, PIN_PA1, PIN_PC3, PIN_PC2, PIN_PC1};
 const uint8_t INT_PIN = PIN_PC0;
 const uint8_t LED_CTRL_PIN = PIN_PA7;
 #undef LED_BUILTIN
@@ -45,7 +50,7 @@ const uint8_t LED_CTRL_PIN = PIN_PA7;
 #endif
 static const uint8_t keytab[NUM_COLS][NUM_ROWS] = 
           { {'*', '7', '4', '1'}, { '0', '8', '5', '2' },
-            {'#', '9', '6', '3'}, { 'D', 'C', 'B', 'A'} };
+            {'#', '9', '6', '3'}, { 'D'+0x80, 'C'+0x80, 'B'+0x80, 'A'+0x80} };
             
 static uint8_t previousState[NUM_COLS][NUM_ROWS];
 static uint8_t pressed[NUM_COLS][NUM_ROWS];
@@ -71,8 +76,9 @@ volatile uint8_t int_pin_mode = 0;
  *     | | | | | +----- Interrupt pin mode 1
  *     | | | | +------- Numeric keys enable
  *     | | | +--------- Alpha numeric keys enable
+ *     | | +----------- No function (Write 0)
  *     | +------------- No function (Write 0)
- *     +--------------- No function (Write 0)
+ *     +--------------- Reset device
  *     
  * Bit 0 : Interrupt enable (Default : 0)
  *   Setting this bit high will enable interrupts from the keyboard 
@@ -91,6 +97,13 @@ volatile uint8_t int_pin_mode = 0;
  *   
  * Bit 4 : Disable  alpha numeric keys (A-D) (Default : 0)
  *   Setting this bit high will disable the alpha numeric keys on the keyboard.
+ *   
+ * Bits 5 and 6 : No function
+ *   These are unimplemented control bits but should be written 0 to ensure
+ *   compatability with future firmware releases.
+ *   
+ * Bit 7 : Reset device.
+ *   This bit is used to reset the device to a known stat.
  * 
  */
 #define CTRL_REG                    0
@@ -99,6 +112,7 @@ volatile uint8_t int_pin_mode = 0;
 #define CTRL_REG_INT_PIN_MODE_1     0x04
 #define CTRL_REG_NUM_KEYS_DISABLE   0x08
 #define CTRL_REG_ALPHA_KEYS_DISABLE 0x10
+#define CTRL_REG_RESET              0x80
 
 /* addr: 0 (Read)   - Status register (STAT_REG)
  * 
@@ -132,6 +146,10 @@ volatile uint8_t int_pin_mode = 0;
 
 /* addr: 2 (Read)   - Returns the number of key entries in the buffer (NUM_KEYS_REG)
  * 
+ */
+#define NUM_KEYS_REG                  2
+
+/*
  * addr: 3 (Write)  - Status LED control register (LED_CTRL_REG_1)
  * 
  * This register controls the behavior of the status LED.
@@ -140,11 +158,12 @@ volatile uint8_t int_pin_mode = 0;
  *    |7|6|5|4|3|2|1|0|
  *    +-+-+-+-+-+-+-+-+
  *     | | | | | | | |
- *     | | | | | | | +- mode 0
- *     | | | | | | +--- mode 1
- *     | | | | | +----- mode 2
- *     | | | | +------- mode 3
+ *     | | | | | | | +- mode bit 0
+ *     | | | | | | +--- mode bit 1
+ *     | | | | | +----- mode bit 2
+ *     | | | | +------- mode bit 3
  *     | | | +--------- No function
+ *     | | +------------No function
  *     | +------------- No function
  *     +--------------- No function
  *     
@@ -154,23 +173,79 @@ volatile uint8_t int_pin_mode = 0;
  *    mode 2 - The LED is blinking with 1 Hz.
  *    mode 3 - The LED is blinking with 2 Hz.
  *    mode 4 - The LED is blinking with 4 Hz.
- *    mode 5 - The LED is candle light effect.
+ *    mode 5 - Not implemented
  *    mode 6 - Not implemented
  *    mode 7 - Not implemented
  * 
- * addr: 4 (Write)  - LEDs A and B control register
- * addr: 5 (Write)  - LEDs C and D control register
+ */
+#define LED_CTRL_REG_1  3
+
+/*
+ * addr: 4 (Write)  - Status LED control register (LED_CTRL_REG_2)
+ * 
+ * This register controls the behavior of the indicator LED's 1 and 2.
+ * 
+ *    +-+-+-+-+-+-+-+-+
+ *    |7|6|5|4|3|2|1|0|
+ *    +-+-+-+-+-+-+-+-+
+ *     | | | | | | | |
+ *     | | | | | | | +- LED 1 mode bit 0
+ *     | | | | | | +--- LED 1 mode bit 1
+ *     | | | | | +----- LED 1 mode bit 2
+ *     | | | | +------- LED 1 mode bit 3
+ *     | | | +--------- LED 2 mode bit 0
+ *     | | +------------LED 2 mode bit 1
+ *     | +------------- LED 2 mode bit 2
+ *     +--------------- LED 2 mode bit 3
+ *     
+ *  operation modes:
+ *    mode 0 - The LED is turned off.
+ *    mode 1 - The LED is turned on with a fixed light.
+ *    mode 2 - The LED is blinking with 1 Hz.
+ *    mode 3 - The LED is blinking with 2 Hz.
+ *    mode 4 - The LED is blinking with 4 Hz.
+ *    mode 5 - Not implemented
+ *    mode 6 - Not implemented
+ *    mode 7 - Not implemented
  * 
  */
+#define LED_CTRL_REG_2  4
+
+/*
+ * addr: 5 (Write)  - Status LED control register (LED_CTRL_REG_3)
+ * 
+ * This register controls the behavior of the indicator LED's 3 and 4.
+ * 
+ *    +-+-+-+-+-+-+-+-+
+ *    |7|6|5|4|3|2|1|0|
+ *    +-+-+-+-+-+-+-+-+
+ *     | | | | | | | |
+ *     | | | | | | | +- LED 3 mode bit 0
+ *     | | | | | | +--- LED 3 mode bit 1
+ *     | | | | | +----- LED 3 mode bit 2
+ *     | | | | +------- LED 3 mode bit 3
+ *     | | | +--------- LED 4 mode bit 0
+ *     | | +------------LED 4 mode bit 1
+ *     | +------------- LED 4 mode bit 2
+ *     +--------------- LED 4 mode bit 3
+ *     
+ *  operation modes:
+ *    mode 0 - The LED is turned off.
+ *    mode 1 - The LED is turned on with a fixed light.
+ *    mode 2 - The LED is blinking with 1 Hz.
+ *    mode 3 - The LED is blinking with 2 Hz.
+ *    mode 4 - The LED is blinking with 4 Hz.
+ *    mode 5 - Not implemented
+ *    mode 6 - Not implemented
+ *    mode 7 - Not implemented
+ * 
+ */
+#define LED_CTRL_REG_3  5
+
 #define NUM_REGS        6
 // Two complete register files (control and status registers) are maintained.
 uint8_t ctrl_registers[NUM_REGS];
 uint8_t stat_registers[NUM_REGS];
-#define NUM_KEYS_REG    2
-#define LED_CTRL_REG_1  3
-#define LED_CTRL_REG_2  4
-#define LED_CTRL_REG_3  5
-
 
 typedef enum led_mode_e {
   LED_OFF = 0,
@@ -205,13 +280,15 @@ void LED::setup(int pin, led_mode_t mode, int alpha, int delay) {
   _pin = pin;
   _alpha = alpha;
   _updateDelay = delay;
-  // random first upate to prevent multiple flames looking synchronous
+  // random first upate to prevent multiple sequences looking synchronous
   _nextUpdate  = millis() + random(_updateDelay);
 }
 
 void LED::setmode(led_mode_t newmode) {
   _mode = newmode;
+  _nextUpdate = millis() + 1;  // Ensures a quick update.
 }
+
 void LED::restore() {
   if (_mode == LED_CANDLE)
     analogWrite(_pin, _brightness);
@@ -268,10 +345,7 @@ void LED::process() {
   }
 }
 
-LED led0;
-LED led1;
-LED led2;
-LED led3;
+LED leds[NUM_LEDS];
 
 void i2cReceive(int bytesReceived) {
   // When receiving more than 1 bytes the transaction is determined to be
@@ -290,10 +364,14 @@ void i2cRequest() {
   // Single register read.
   switch (i2cRegister) {
     case STAT_REG:
+      Wire.write(stat_registers[i2cRegister]);
+      break;
+      
     case LED_CTRL_REG_1:
     case LED_CTRL_REG_2:
     case LED_CTRL_REG_3:
-      Wire.write(stat_registers[i2cRegister]);
+      // LED control registers are simply returned here
+      Wire.write(ctrl_registers[i2cRegister]);
       break;
 
     case NUM_KEYS_REG:
@@ -357,10 +435,8 @@ void setup() {
   Wire.onReceive(i2cReceive);
   Wire.onRequest(i2cRequest);
 
-  led0.setup(PIN_PC1, LED_OFF, 70);
-  led1.setup(PIN_PC2, LED_BLINK_1HZ);
-  led2.setup(PIN_PC3, LED_BLINK_2HZ);
-  led3.setup(PIN_PA1, LED_ON);
+  for (int i=0; i < NUM_LEDS; i++)
+    leds[i].setup(led_pins[i], LED_OFF);
 }
 
 // The main loop
@@ -386,33 +462,34 @@ void loop() {
         if (pin_state == LOW && previousState[i][j] == LOW && pressed[i][j] == false) {
           pressed[i][j] = true;
           // This happens when a key is pressed down.
-          key_queue.unshift(keytab[i][j]);
-          // Did the user request interupts ?
-          if (ctrl_registers[CTRL_REG] & CTRL_REG_INTERRUPT_ENABLE) {
-            // Depending on the interrupt pin mode we need to treat it differently
-            switch (int_pin_mode) {
-              case 0:
-              case 1:
-                pinMode(INT_PIN, OUTPUT);   // Short interrupt pulse
-                pinMode(INT_PIN, INPUT_PULLUP);
-                break;
-    
-              case 2:
-                digitalWrite(INT_PIN, HIGH);
-                digitalWrite(INT_PIN, LOW);     // Short high pulse
-                break;
-    
-              case 3:
-                digitalWrite(INT_PIN, LOW);
-                digitalWrite(INT_PIN, HIGH);    // Short low pulse
-                break;
+          if (!(ctrl_registers[CTRL_REG] & CTRL_REG_NUM_KEYS_DISABLE) && !(keytab[i][j] & 0x80) || 
+             (!(ctrl_registers[CTRL_REG] & CTRL_REG_ALPHA_KEYS_DISABLE) && keytab[i][j] & 0x80)) {
+            key_queue.unshift(keytab[i][j] & 0x7F);
+            // Did the user request interupts ?
+            if (ctrl_registers[CTRL_REG] & CTRL_REG_INTERRUPT_ENABLE) {
+              // Depending on the interrupt pin mode we need to treat it differently
+              switch (int_pin_mode) {
+                case 0:
+                case 1:
+                  pinMode(INT_PIN, OUTPUT);   // Short interrupt pulse
+                  pinMode(INT_PIN, INPUT_PULLUP);
+                  break;
+      
+                case 2:
+                  digitalWrite(INT_PIN, HIGH);
+                  digitalWrite(INT_PIN, LOW);     // Short high pulse
+                  break;
+      
+                case 3:
+                  digitalWrite(INT_PIN, LOW);
+                  digitalWrite(INT_PIN, HIGH);    // Short low pulse
+                  break;
+              }
             }
-            digitalWrite(LED_BUILTIN, HIGH);
+            stat_registers[STAT_REG] |= STAT_REG_KEY_PRESS;
           }
-          stat_registers[STAT_REG] |= 0x02;
         } else if (pin_state == HIGH && previousState[i][j] == HIGH && pressed[i][j] == true) {
           pressed[i][j] = false;
-          digitalWrite(LED_BUILTIN, LOW);
         }
         // Save current state for next time around.
         previousState[i][j] = pin_state;
@@ -420,17 +497,13 @@ void loop() {
       digitalWrite(columns[i], HIGH);
     }
     // Restore the state of all LED pins.
-    led0.restore();
-    led1.restore();
-    led2.restore();
-    led3.restore();
+    for (int i=0; i<NUM_LEDS; i++)
+      leds[i].restore();
     // And turn them back on
     digitalWrite(LED_CTRL_PIN, LOW);
   } else {
-    led0.process();
-    led1.process();
-    led2.process();
-    led3.process();
+    for (int i=0; i<NUM_LEDS; i++)
+      leds[i].process();
     // Turn LED's back on again
   }
   
@@ -438,6 +511,9 @@ void loop() {
     reg_update = false;
     switch(updated_register) {
       case CTRL_REG:
+        // First check if the user wants to reset the device
+        if (ctrl_registers[CTRL_REG] & CTRL_REG_RESET)
+          ResetViaWDT();
         // Something has changed in the main control register
         // So we need to set the interrupt pin mode.
         int_pin_mode = (ctrl_registers[CTRL_REG] & (CTRL_REG_INT_PIN_MODE_0 | CTRL_REG_INT_PIN_MODE_1)) >> 1;
@@ -463,12 +539,17 @@ void loop() {
       break;
 
       case LED_CTRL_REG_1:
+        leds[0].setmode((led_mode_t)(ctrl_registers[LED_CTRL_REG_1] & 0x0f));
       break;
       
       case LED_CTRL_REG_2:
+        leds[1].setmode((led_mode_t)(ctrl_registers[LED_CTRL_REG_2] & 0x0f));
+        leds[2].setmode((led_mode_t)((ctrl_registers[LED_CTRL_REG_2] >> 4) & 0x0f));
       break;
       
       case LED_CTRL_REG_3:
+        leds[3].setmode((led_mode_t)(ctrl_registers[LED_CTRL_REG_3] & 0x0f));
+        leds[4].setmode((led_mode_t)((ctrl_registers[LED_CTRL_REG_3] >> 4) & 0x0f));
       break;
     }
   }
